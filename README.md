@@ -5,23 +5,21 @@
 
 **Turn [Claude Code](https://claude.com/product/claude-code) into your personal assistant, accessible from anywhere via Telegram.**
 
-Send text, voice, photos, and documents. Claude streams responses in real-time, showing you exactly what tools it's using as it works.
+Send text, voice, photos, and documents. See responses and tools usage in real-time.
 
 ![Demo](assets/demo.gif)
 
 ## Claude Code as a Personal Assistant
 
-This bot shines as a personal assistant you can access from anywhere.
+I've started using Claude Code as a personal assistant, and I've built this bot so I can access it from anywhere.
 
-In fact, while [Claude Code](https://claude.com/product/claude-code) is described as a powerful AI **coding agent**, it's actually a very powerful **general-purpose agent** too if given the right instructions, context, and tools.
+In fact, while Claude Code is described as a powerful AI **coding agent**, it's actually a very capable **general-purpose agent** too when given the right instructions, context, and tools.
 
-So if you set up a folder with a CLAUDE.md that teaches Claude about you (your preferences, where your notes live, your workflows, ...) and then point this bot at that folder, you can have your own 24/7 personal assistant.
+To achieve this, I set up a folder with a CLAUDE.md that teaches Claude about me (my preferences, where my notes live, my workflows), has a set of tools and scripts based on my needs, and pointed this bot at that folder.
 
-Add [MCPs](https://code.claude.com/docs/en/mcp), [commands](https://code.claude.com/docs/en/slash-commands), and [skills](https://code.claude.com/docs/en/skills) to make it more powerful. The fun part: when you need a new capability, just ask Claude to build it, then use it via Telegram.
+→ **[📄 See the Personal Assistant Guide](docs/personal-assistant-guide.md)** for detailed setup and examples.
 
-→ **[📄 See the Personal Assistant Guide](docs/personal-assistant-guide.md)** for detailed setup and an example CLAUDE.md template.
-
-## Features
+## Bot Features
 
 - 💬 **Text**: Ask questions, give instructions, have conversations
 - 🎤 **Voice**: Speak naturally - transcribed via OpenAI and processed by Claude
