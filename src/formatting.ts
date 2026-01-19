@@ -25,6 +25,7 @@ export function convertMarkdownToHtml(text: string): string {
   // Store code blocks temporarily to avoid processing their contents
   const codeBlocks: string[] = [];
   const inlineCodes: string[] = [];
+  const links: { text: string; url: string }[] = [];
 
   // Save code blocks first (```code```)
   text = text.replace(/```(?:\w+)?\n?([\s\S]*?)```/g, (_, code) => {
@@ -36,6 +37,13 @@ export function convertMarkdownToHtml(text: string): string {
   text = text.replace(/`([^`]+)`/g, (_, code) => {
     inlineCodes.push(code);
     return `\x00INLINECODE${inlineCodes.length - 1}\x00`;
+  });
+
+  // Save links BEFORE escaping HTML (URLs may contain special chars like underscores)
+  // This prevents _text_ in URLs from being converted to <i>text</i>
+  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, linkText, url) => {
+    links.push({ text: linkText, url });
+    return `\x00LINK${links.length - 1}\x00`;
   });
 
   // Escape HTML entities in the remaining text
@@ -65,8 +73,15 @@ export function convertMarkdownToHtml(text: string): string {
   // Horizontal rules: --- or *** -> blank line
   text = text.replace(/^[-*]{3,}$/gm, "");
 
-  // Links: [text](url) -> <a href="url">text</a>
-  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+  // Restore links (with escaped text but preserved URL)
+  for (let i = 0; i < links.length; i++) {
+    const link = links[i]!;
+    const escapedText = escapeHtml(link.text);
+    text = text.replace(
+      `\x00LINK${i}\x00`,
+      `<a href="${link.url}">${escapedText}</a>`
+    );
+  }
 
   // Restore code blocks
   for (let i = 0; i < codeBlocks.length; i++) {
