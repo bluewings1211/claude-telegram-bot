@@ -81,6 +81,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   // Generate request ID and get chat context from environment
   const requestUuid = crypto.randomUUID().slice(0, 8);
   const chatId = process.env.TELEGRAM_CHAT_ID || "";
+  const threadAnchorId = process.env.TELEGRAM_THREAD_ANCHOR_ID || "";
 
   // Write request file for the bot to pick up
   const requestData = {
@@ -89,6 +90,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     options,
     status: "pending",
     chat_id: chatId,
+    thread_anchor_id: threadAnchorId,
     created_at: new Date().toISOString(),
   };
 

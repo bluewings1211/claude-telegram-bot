@@ -1,192 +1,277 @@
 /**
  * Command handlers for Claude Telegram Bot.
  *
- * /start, /new, /stop, /status, /resume, /restart
+ * /start, /new, /stop, /status, /resume, /restart, /retry
+ * Updated for multi-session thread-based architecture.
  */
 
 import type { Context } from "grammy";
-import { session } from "../session";
+import { InlineKeyboard } from "grammy";
+import { sessionManager } from "../session-manager";
 import { WORKING_DIR, ALLOWED_USERS, RESTART_FILE } from "../config";
 import { isAuthorized } from "../security";
+
+/**
+ * Format duration in human readable form.
+ */
+function formatDuration(ms: number): string {
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
 
 /**
  * /start - Show welcome message and status.
  */
 export async function handleStart(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
-  const username = ctx.from?.username || "unknown";
+  const chatId = ctx.chat?.id;
+  const messageId = ctx.message?.message_id;
 
   if (!isAuthorized(userId, ALLOWED_USERS)) {
-    await ctx.reply("Unauthorized. Contact the bot owner for access.");
+    await ctx.reply("Unauthorized. Contact the bot owner for access.", {
+      reply_to_message_id: messageId,
+    });
     return;
   }
 
-  const status = session.isActive ? "Active session" : "No active session";
-  const workDir = WORKING_DIR;
+  const sessions = chatId ? sessionManager.getSessionsForChat(chatId) : [];
+  const activeSessions = sessions.filter((s) => s.isActive);
+  const runningSessions = sessions.filter((s) => s.isRunning);
+
+  let status = "No active sessions";
+  if (runningSessions.length > 0) {
+    status = `${runningSessions.length} running, ${activeSessions.length} active`;
+  } else if (activeSessions.length > 0) {
+    status = `${activeSessions.length} active sessions`;
+  }
 
   await ctx.reply(
     `🤖 <b>Claude Telegram Bot</b>\n\n` +
       `Status: ${status}\n` +
-      `Working directory: <code>${workDir}</code>\n\n` +
+      `Working directory: <code>${WORKING_DIR}</code>\n\n` +
       `<b>Commands:</b>\n` +
-      `/new - Start fresh session\n` +
-      `/stop - Stop current query\n` +
-      `/status - Show detailed status\n` +
-      `/resume - Resume last session\n` +
+      `/new - Clear all sessions\n` +
+      `/stop - Stop running queries\n` +
+      `/status - Show all sessions\n` +
+      `/resume - Resume saved session\n` +
       `/retry - Retry last message\n` +
       `/restart - Restart the bot\n\n` +
       `<b>Tips:</b>\n` +
-      `• Prefix with <code>!</code> to interrupt current query\n` +
-      `• Use "think" keyword for extended reasoning\n` +
-      `• Send photos, voice, or documents`,
-    { parse_mode: "HTML" }
+      `• Each message starts a new thread\n` +
+      `• Reply to continue a thread\n` +
+      `• Prefix with <code>!</code> to interrupt\n` +
+      `• Use "think" keyword for extended reasoning`,
+    { parse_mode: "HTML", reply_to_message_id: messageId }
   );
 }
 
 /**
- * /new - Start a fresh session.
+ * /new - Clear all sessions and start fresh.
  */
 export async function handleNew(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
+  const chatId = ctx.chat?.id;
+  const messageId = ctx.message?.message_id;
 
   if (!isAuthorized(userId, ALLOWED_USERS)) {
-    await ctx.reply("Unauthorized.");
+    await ctx.reply("Unauthorized.", { reply_to_message_id: messageId });
     return;
   }
 
-  // Stop any running query
-  if (session.isRunning) {
-    const result = await session.stop();
-    if (result) {
-      await Bun.sleep(100);
-      session.clearStopRequested();
-    }
+  if (!chatId) return;
+
+  // Stop all running queries
+  const stoppedCount = await sessionManager.stopAllSessions(chatId);
+
+  // Clear all sessions for this chat
+  const clearedCount = sessionManager.clearSessionsForChat(chatId);
+
+  if (stoppedCount > 0 || clearedCount > 0) {
+    await ctx.reply(
+      `🆕 Cleared ${clearedCount} session(s), stopped ${stoppedCount} running query(s).\nNext message starts a new thread.`,
+      { reply_to_message_id: messageId }
+    );
+  } else {
+    await ctx.reply("🆕 No active sessions. Next message starts a new thread.", {
+      reply_to_message_id: messageId,
+    });
   }
-
-  // Clear session
-  await session.kill();
-
-  await ctx.reply("🆕 Session cleared. Next message starts fresh.");
 }
 
 /**
- * /stop - Stop the current query (silently).
+ * /stop - Stop running queries.
+ * If in a thread, stop that thread. Otherwise stop all.
  */
 export async function handleStop(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
+  const chatId = ctx.chat?.id;
+  const messageId = ctx.message?.message_id;
+  const replyToId = ctx.message?.reply_to_message?.message_id;
 
   if (!isAuthorized(userId, ALLOWED_USERS)) {
-    await ctx.reply("Unauthorized.");
+    await ctx.reply("Unauthorized.", { reply_to_message_id: messageId });
     return;
   }
 
-  if (session.isRunning) {
+  if (!chatId) return;
+
+  // If user replied to a message, try to stop that specific thread
+  if (replyToId) {
+    const session = sessionManager.getSession(chatId, replyToId);
+    if (session?.isRunning) {
+      const result = await session.stop();
+      if (result) {
+        await Bun.sleep(100);
+        session.clearStopRequested();
+        await ctx.reply("🛑 Stopped.", { reply_to_message_id: replyToId });
+      }
+      return;
+    }
+  }
+
+  // Otherwise stop all running sessions
+  const sessions = sessionManager.getSessionsForChat(chatId);
+  const running = sessions.filter((s) => s.isRunning);
+
+  if (running.length === 0) {
+    // Silent if nothing running
+    return;
+  }
+
+  let stoppedCount = 0;
+  for (const session of running) {
     const result = await session.stop();
     if (result) {
-      // Wait for the abort to be processed, then clear stopRequested so next message can proceed
-      await Bun.sleep(100);
+      stoppedCount++;
+      await Bun.sleep(50);
       session.clearStopRequested();
     }
-    // Silent stop - no message shown
   }
-  // If nothing running, also stay silent
+
+  if (stoppedCount > 0) {
+    await ctx.reply(`🛑 Stopped ${stoppedCount} query(s).`, {
+      reply_to_message_id: messageId,
+    });
+  }
 }
 
 /**
- * /status - Show detailed status.
+ * /status - Show detailed status of all sessions.
  */
 export async function handleStatus(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
+  const chatId = ctx.chat?.id;
+  const messageId = ctx.message?.message_id;
 
   if (!isAuthorized(userId, ALLOWED_USERS)) {
-    await ctx.reply("Unauthorized.");
+    await ctx.reply("Unauthorized.", { reply_to_message_id: messageId });
     return;
   }
 
+  if (!chatId) return;
+
+  const sessions = sessionManager.getSessionsForChat(chatId);
   const lines: string[] = ["📊 <b>Bot Status</b>\n"];
 
-  // Session status
-  if (session.isActive) {
-    lines.push(`✅ Session: Active (${session.sessionId?.slice(0, 8)}...)`);
+  if (sessions.length === 0) {
+    lines.push("No active sessions.");
+    lines.push("\nSend a message to start a new thread.");
   } else {
-    lines.push("⚪ Session: None");
-  }
+    lines.push(`<b>${sessions.length} Session(s):</b>\n`);
 
-  // Query status
-  if (session.isRunning) {
-    const elapsed = session.queryStarted
-      ? Math.floor((Date.now() - session.queryStarted.getTime()) / 1000)
-      : 0;
-    lines.push(`🔄 Query: Running (${elapsed}s)`);
-    if (session.currentTool) {
-      lines.push(`   └─ ${session.currentTool}`);
+    for (const session of sessions) {
+      const stateEmoji = session.isRunning ? "🔄" : session.isActive ? "✅" : "⚪";
+      const state = session.isRunning
+        ? "Running"
+        : session.isActive
+          ? "Active"
+          : "Idle";
+
+      lines.push(`${stateEmoji} <b>Thread ${session.threadAnchorId}</b>`);
+      lines.push(`   Title: ${session.title}`);
+      lines.push(`   State: ${state}`);
+
+      if (session.isRunning && session.queryStarted) {
+        const elapsed = Date.now() - session.queryStarted.getTime();
+        lines.push(`   Running: ${formatDuration(elapsed)}`);
+        if (session.currentTool) {
+          lines.push(`   └─ ${session.currentTool}`);
+        }
+      }
+
+      if (session.lastActivity) {
+        const ago = Date.now() - session.lastActivity.getTime();
+        lines.push(`   Last activity: ${formatDuration(ago)} ago`);
+      }
+
+      if (session.lastUsage) {
+        const u = session.lastUsage;
+        lines.push(
+          `   Tokens: ${u.input_tokens?.toLocaleString() || "?"} in / ${u.output_tokens?.toLocaleString() || "?"} out`
+        );
+      }
+
+      if (session.lastError) {
+        lines.push(`   ⚠️ Error: ${session.lastError}`);
+      }
+
+      lines.push("");
     }
-  } else {
-    lines.push("⚪ Query: Idle");
-    if (session.lastTool) {
-      lines.push(`   └─ Last: ${session.lastTool}`);
-    }
   }
 
-  // Last activity
-  if (session.lastActivity) {
-    const ago = Math.floor(
-      (Date.now() - session.lastActivity.getTime()) / 1000
-    );
-    lines.push(`\n⏱️ Last activity: ${ago}s ago`);
-  }
+  lines.push(`📁 Working dir: <code>${WORKING_DIR}</code>`);
 
-  // Usage stats
-  if (session.lastUsage) {
-    const usage = session.lastUsage;
-    lines.push(
-      `\n📈 Last query usage:`,
-      `   Input: ${usage.input_tokens?.toLocaleString() || "?"} tokens`,
-      `   Output: ${usage.output_tokens?.toLocaleString() || "?"} tokens`
-    );
-    if (usage.cache_read_input_tokens) {
-      lines.push(
-        `   Cache read: ${usage.cache_read_input_tokens.toLocaleString()}`
-      );
-    }
-  }
-
-  // Error status
-  if (session.lastError) {
-    const ago = session.lastErrorTime
-      ? Math.floor((Date.now() - session.lastErrorTime.getTime()) / 1000)
-      : "?";
-    lines.push(`\n⚠️ Last error (${ago}s ago):`, `   ${session.lastError}`);
-  }
-
-  // Working directory
-  lines.push(`\n📁 Working dir: <code>${WORKING_DIR}</code>`);
-
-  await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
+  await ctx.reply(lines.join("\n"), {
+    parse_mode: "HTML",
+    reply_to_message_id: messageId,
+  });
 }
 
 /**
- * /resume - Resume the last session.
+ * /resume - Show saved sessions and let user choose which to resume.
  */
 export async function handleResume(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
+  const chatId = ctx.chat?.id;
+  const messageId = ctx.message?.message_id;
 
   if (!isAuthorized(userId, ALLOWED_USERS)) {
-    await ctx.reply("Unauthorized.");
+    await ctx.reply("Unauthorized.", { reply_to_message_id: messageId });
     return;
   }
 
-  if (session.isActive) {
-    await ctx.reply("Session already active. Use /new to start fresh first.");
+  if (!chatId) return;
+
+  // Get persisted sessions
+  const persisted = sessionManager.getPersistedSessions(chatId);
+
+  if (persisted.length === 0) {
+    await ctx.reply("❌ No saved sessions to resume.", {
+      reply_to_message_id: messageId,
+    });
     return;
   }
 
-  const [success, message] = session.resumeLast();
-  if (success) {
-    await ctx.reply(`✅ ${message}`);
-  } else {
-    await ctx.reply(`❌ ${message}`);
+  // Show inline keyboard with session choices
+  const keyboard = new InlineKeyboard();
+
+  for (let i = 0; i < Math.min(persisted.length, 5); i++) {
+    const s = persisted[i]!;
+    const age = formatDuration(
+      Date.now() - new Date(s.last_activity).getTime()
+    );
+    const label = `${s.title?.slice(0, 25) || "Untitled"} (${age})`;
+    keyboard.text(label, `resume:${s.thread_anchor_id}`).row();
   }
+
+  await ctx.reply("Select a session to resume:", {
+    reply_markup: keyboard,
+    reply_to_message_id: messageId,
+  });
 }
 
 /**
@@ -195,13 +280,19 @@ export async function handleResume(ctx: Context): Promise<void> {
 export async function handleRestart(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
   const chatId = ctx.chat?.id;
+  const messageId = ctx.message?.message_id;
 
   if (!isAuthorized(userId, ALLOWED_USERS)) {
-    await ctx.reply("Unauthorized.");
+    await ctx.reply("Unauthorized.", { reply_to_message_id: messageId });
     return;
   }
 
-  const msg = await ctx.reply("🔄 Restarting bot...");
+  // Save sessions before restart
+  sessionManager.saveSessions();
+
+  const msg = await ctx.reply("🔄 Restarting bot...", {
+    reply_to_message_id: messageId,
+  });
 
   // Save message info so we can update it after restart
   if (chatId && msg.message_id) {
@@ -227,41 +318,72 @@ export async function handleRestart(ctx: Context): Promise<void> {
 }
 
 /**
- * /retry - Retry the last message (resume session and re-send).
+ * /retry - Retry the last message in a thread.
  */
 export async function handleRetry(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
+  const chatId = ctx.chat?.id;
+  const messageId = ctx.message?.message_id;
+  const replyToId = ctx.message?.reply_to_message?.message_id;
 
   if (!isAuthorized(userId, ALLOWED_USERS)) {
-    await ctx.reply("Unauthorized.");
+    await ctx.reply("Unauthorized.", { reply_to_message_id: messageId });
     return;
   }
 
-  // Check if there's a message to retry
-  if (!session.lastMessage) {
-    await ctx.reply("❌ No message to retry.");
+  if (!chatId) return;
+
+  // If user replied to a message, find that session
+  let session;
+  if (replyToId) {
+    session = sessionManager.getSession(chatId, replyToId);
+  }
+
+  // Otherwise, find the most recent session with a lastMessage
+  if (!session) {
+    const sessions = sessionManager
+      .getSessionsForChat(chatId)
+      .filter((s) => s.lastMessage)
+      .sort(
+        (a, b) =>
+          (b.lastActivity?.getTime() || 0) - (a.lastActivity?.getTime() || 0)
+      );
+    session = sessions[0];
+  }
+
+  if (!session?.lastMessage) {
+    await ctx.reply("❌ No message to retry.", {
+      reply_to_message_id: messageId,
+    });
     return;
   }
 
-  // Check if something is already running
   if (session.isRunning) {
-    await ctx.reply("⏳ A query is already running. Use /stop first.");
+    await ctx.reply("⏳ A query is already running in that thread. Use /stop first.", {
+      reply_to_message_id: messageId,
+    });
     return;
   }
 
   const message = session.lastMessage;
-  await ctx.reply(`🔄 Retrying: "${message.slice(0, 50)}${message.length > 50 ? "..." : ""}"`);
+  const threadAnchorId = session.threadAnchorId;
 
-  // Simulate sending the message again by emitting a fake text message event
-  // We do this by directly calling the text handler logic
+  await ctx.reply(
+    `🔄 Retrying in thread ${threadAnchorId}: "${message.slice(0, 50)}${message.length > 50 ? "..." : ""}"`,
+    { reply_to_message_id: messageId }
+  );
+
+  // Import and use handleText directly with a fake context
   const { handleText } = await import("./text");
 
-  // Create a modified context with the last message
+  // Create a modified context that points to the original thread
   const fakeCtx = {
     ...ctx,
     message: {
       ...ctx.message,
+      message_id: threadAnchorId, // Use the original thread anchor
       text: message,
+      reply_to_message: undefined, // Clear reply so it uses the message_id as anchor
     },
   } as Context;
 

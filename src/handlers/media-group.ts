@@ -2,7 +2,7 @@
  * Shared media group handling for Claude Telegram Bot.
  *
  * Provides a generic buffer for handling Telegram media groups (albums)
- * with configurable processing callbacks.
+ * with configurable processing callbacks and thread support.
  */
 
 import type { Context } from "grammy";
@@ -11,7 +11,14 @@ import type { PendingMediaGroup } from "../types";
 import { MEDIA_GROUP_TIMEOUT } from "../config";
 import { rateLimiter } from "../security";
 import { auditLogRateLimit } from "../utils";
-import { session } from "../session";
+import { sessionManager } from "../session-manager";
+
+/**
+ * Extended pending media group with thread anchor support.
+ */
+interface PendingMediaGroupWithThread extends PendingMediaGroup {
+  threadAnchorId: number;
+}
 
 /**
  * Configuration for a media group handler.
@@ -27,6 +34,7 @@ export interface MediaGroupConfig {
 
 /**
  * Callback to process a completed media group.
+ * Now includes threadAnchorId for thread-based conversations.
  */
 export type ProcessGroupCallback = (
   ctx: Context,
@@ -34,7 +42,8 @@ export type ProcessGroupCallback = (
   caption: string | undefined,
   userId: number,
   username: string,
-  chatId: number
+  chatId: number,
+  threadAnchorId: number
 ) => Promise<void>;
 
 /**
@@ -43,7 +52,7 @@ export type ProcessGroupCallback = (
  * Returns functions for adding items and processing groups.
  */
 export function createMediaGroupBuffer(config: MediaGroupConfig) {
-  const pendingGroups = new Map<string, PendingMediaGroup>();
+  const pendingGroups = new Map<string, PendingMediaGroupWithThread>();
 
   /**
    * Process a completed media group.
@@ -86,7 +95,8 @@ export function createMediaGroupBuffer(config: MediaGroupConfig) {
       group.caption,
       userId,
       username,
-      chatId
+      chatId,
+      group.threadAnchorId
     );
 
     // Delete status message
@@ -115,21 +125,29 @@ export function createMediaGroupBuffer(config: MediaGroupConfig) {
     username: string,
     processCallback: ProcessGroupCallback
   ): Promise<boolean> {
+    const messageId = ctx.message?.message_id;
+    if (!messageId) return false;
+
     if (!pendingGroups.has(mediaGroupId)) {
       // Rate limit on first item only
       const [allowed, retryAfter] = rateLimiter.check(userId);
       if (!allowed) {
         await auditLogRateLimit(userId, username, retryAfter!);
         await ctx.reply(
-          `⏳ Rate limited. Please wait ${retryAfter!.toFixed(1)} seconds.`
+          `⏳ Rate limited. Please wait ${retryAfter!.toFixed(1)} seconds.`,
+          { reply_to_message_id: messageId }
         );
         return false;
       }
 
+      // The first message in the media group becomes the thread anchor
+      const threadAnchorId = messageId;
+
       // Create new group
       console.log(`Receiving ${config.itemLabel} album from @${username}`);
       const statusMsg = await ctx.reply(
-        `${config.emoji} Receiving ${config.itemLabelPlural}...`
+        `${config.emoji} Receiving ${config.itemLabelPlural}...`,
+        { reply_to_message_id: threadAnchorId }
       );
 
       pendingGroups.set(mediaGroupId, {
@@ -137,6 +155,7 @@ export function createMediaGroupBuffer(config: MediaGroupConfig) {
         ctx,
         caption: ctx.message?.caption,
         statusMsg,
+        threadAnchorId,
         timeout: setTimeout(
           () => processGroup(mediaGroupId, processCallback),
           MEDIA_GROUP_TIMEOUT
@@ -178,7 +197,9 @@ export function createMediaGroupBuffer(config: MediaGroupConfig) {
 export async function handleProcessingError(
   ctx: Context,
   error: unknown,
-  toolMessages: Message[]
+  toolMessages: Message[],
+  threadAnchorId: number,
+  chatId: number
 ): Promise<void> {
   console.error("Error processing media:", error);
 
@@ -194,12 +215,17 @@ export async function handleProcessingError(
   // Send error message
   const errorStr = String(error);
   if (errorStr.includes("abort") || errorStr.includes("cancel")) {
-    // Only show "Query stopped" if it was an explicit stop, not an interrupt from a new message
-    const wasInterrupt = session.consumeInterruptFlag();
+    // Check if it was an interrupt from a new message
+    const session = sessionManager.getSession(chatId, threadAnchorId);
+    const wasInterrupt = session?.consumeInterruptFlag() ?? false;
     if (!wasInterrupt) {
-      await ctx.reply("🛑 Query stopped.");
+      await ctx.reply("🛑 Query stopped.", {
+        reply_to_message_id: threadAnchorId,
+      });
     }
   } else {
-    await ctx.reply(`❌ Error: ${errorStr.slice(0, 200)}`);
+    await ctx.reply(`❌ Error: ${errorStr.slice(0, 200)}`, {
+      reply_to_message_id: threadAnchorId,
+    });
   }
 }

@@ -2,6 +2,7 @@
  * Shared streaming callback for Claude Telegram Bot handlers.
  *
  * Provides a reusable status callback for streaming Claude responses.
+ * All replies are threaded using reply_to_message_id for conversation organization.
  */
 
 import type { Context } from "grammy";
@@ -42,7 +43,8 @@ export function createAskUserKeyboard(
  */
 export async function checkPendingAskUserRequests(
   ctx: Context,
-  chatId: number
+  chatId: number,
+  threadAnchorId?: number
 ): Promise<boolean> {
   const glob = new Bun.Glob("ask-user-*.json");
   let buttonsSent = false;
@@ -64,7 +66,10 @@ export async function checkPendingAskUserRequests(
 
       if (options.length > 0 && requestId) {
         const keyboard = createAskUserKeyboard(requestId, options);
-        await ctx.reply(`❓ ${question}`, { reply_markup: keyboard });
+        await ctx.reply(`❓ ${question}`, {
+          reply_markup: keyboard,
+          reply_to_message_id: threadAnchorId,
+        });
         buttonsSent = true;
 
         // Mark as sent
@@ -91,10 +96,12 @@ export class StreamingState {
 
 /**
  * Create a status callback for streaming updates.
+ * All replies are threaded to the threadAnchorId message.
  */
 export function createStatusCallback(
   ctx: Context,
-  state: StreamingState
+  state: StreamingState,
+  threadAnchorId: number
 ): StatusCallback {
   return async (statusType: string, content: string, segmentId?: number) => {
     try {
@@ -105,10 +112,14 @@ export function createStatusCallback(
         const escaped = escapeHtml(preview);
         const thinkingMsg = await ctx.reply(`🧠 <i>${escaped}</i>`, {
           parse_mode: "HTML",
+          reply_to_message_id: threadAnchorId,
         });
         state.toolMessages.push(thinkingMsg);
       } else if (statusType === "tool") {
-        const toolMsg = await ctx.reply(content, { parse_mode: "HTML" });
+        const toolMsg = await ctx.reply(content, {
+          parse_mode: "HTML",
+          reply_to_message_id: threadAnchorId,
+        });
         state.toolMessages.push(toolMsg);
       } else if (statusType === "text" && segmentId !== undefined) {
         const now = Date.now();
@@ -122,13 +133,18 @@ export function createStatusCallback(
               : content;
           const formatted = convertMarkdownToHtml(display);
           try {
-            const msg = await ctx.reply(formatted, { parse_mode: "HTML" });
+            const msg = await ctx.reply(formatted, {
+              parse_mode: "HTML",
+              reply_to_message_id: threadAnchorId,
+            });
             state.textMessages.set(segmentId, msg);
             state.lastContent.set(segmentId, formatted);
           } catch (htmlError) {
             // HTML parse failed, fall back to plain text
             console.debug("HTML reply failed, using plain text:", htmlError);
-            const msg = await ctx.reply(formatted);
+            const msg = await ctx.reply(formatted, {
+              reply_to_message_id: threadAnchorId,
+            });
             state.textMessages.set(segmentId, msg);
             state.lastContent.set(segmentId, formatted);
           }
@@ -203,13 +219,18 @@ export function createStatusCallback(
             for (let i = 0; i < formatted.length; i += TELEGRAM_SAFE_LIMIT) {
               const chunk = formatted.slice(i, i + TELEGRAM_SAFE_LIMIT);
               try {
-                await ctx.reply(chunk, { parse_mode: "HTML" });
+                await ctx.reply(chunk, {
+                  parse_mode: "HTML",
+                  reply_to_message_id: threadAnchorId,
+                });
               } catch (htmlError) {
                 console.debug(
                   "HTML chunk failed, using plain text:",
                   htmlError
                 );
-                await ctx.reply(chunk);
+                await ctx.reply(chunk, {
+                  reply_to_message_id: threadAnchorId,
+                });
               }
             }
           }

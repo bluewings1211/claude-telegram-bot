@@ -201,36 +201,20 @@ export function startTypingIndicator(ctx: Context): TypingController {
 
 // ============== Message Interrupt ==============
 
-// Import session lazily to avoid circular dependency
-let sessionModule: {
-  session: {
-    isRunning: boolean;
-    stop: () => Promise<"stopped" | "pending" | false>;
-    markInterrupt: () => void;
-    clearStopRequested: () => void;
-  };
-} | null = null;
-
-export async function checkInterrupt(text: string): Promise<string> {
+/**
+ * Check if a message has an interrupt prefix (!) and strip it.
+ * Returns the stripped text and whether it was an interrupt.
+ */
+export function checkInterruptPrefix(text: string): {
+  text: string;
+  isInterrupt: boolean;
+} {
   if (!text || !text.startsWith("!")) {
-    return text;
+    return { text, isInterrupt: false };
   }
 
-  // Lazy import to avoid circular dependency
-  if (!sessionModule) {
-    sessionModule = await import("./session");
-  }
-
-  const strippedText = text.slice(1).trimStart();
-
-  if (sessionModule.session.isRunning) {
-    console.log("! prefix - interrupting current query");
-    sessionModule.session.markInterrupt();
-    await sessionModule.session.stop();
-    await Bun.sleep(100);
-    // Clear stopRequested so the new message can proceed
-    sessionModule.session.clearStopRequested();
-  }
-
-  return strippedText;
+  return {
+    text: text.slice(1).trimStart(),
+    isInterrupt: true,
+  };
 }

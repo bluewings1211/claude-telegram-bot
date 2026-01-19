@@ -1,8 +1,8 @@
 /**
- * Session management for Claude Telegram Bot.
+ * Thread-based session management for Claude Telegram Bot.
  *
- * ClaudeSession class manages Claude Code sessions using the Agent SDK V1.
- * V1 supports full options (cwd, mcpServers, settingSources, etc.)
+ * ThreadSession class manages individual Claude Code sessions using the Agent SDK.
+ * Each thread (conversation) in Telegram has its own ThreadSession instance.
  */
 
 import {
@@ -10,13 +10,11 @@ import {
   type Options,
   type SDKMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { readFileSync } from "fs";
 import type { Context } from "grammy";
 import {
   ALLOWED_PATHS,
   MCP_SERVERS,
   SAFETY_PROMPT,
-  SESSION_FILE,
   STREAMING_THROTTLE_MS,
   TEMP_PATHS,
   THINKING_DEEP_KEYWORDS,
@@ -26,7 +24,7 @@ import {
 import { formatToolStatus } from "./formatting";
 import { checkPendingAskUserRequests } from "./handlers/streaming";
 import { checkCommandSafety, isPathAllowed } from "./security";
-import type { SessionData, StatusCallback, TokenUsage } from "./types";
+import type { StatusCallback, ThreadSessionData, TokenUsage } from "./types";
 
 /**
  * Determine thinking token budget based on message keywords.
@@ -49,25 +47,17 @@ function getThinkingLevel(message: string): number {
 }
 
 /**
- * Extract text content from SDK message.
+ * Manages a single Claude Code session for a specific thread.
  */
-function getTextFromMessage(msg: SDKMessage): string | null {
-  if (msg.type !== "assistant") return null;
-
-  const textParts: string[] = [];
-  for (const block of msg.message.content) {
-    if (block.type === "text") {
-      textParts.push(block.text);
-    }
-  }
-  return textParts.length > 0 ? textParts.join("") : null;
-}
-
-/**
- * Manages Claude Code sessions using the Agent SDK V1.
- */
-class ClaudeSession {
+export class ThreadSession {
+  // Identification
   sessionId: string | null = null;
+  chatId: number;
+  threadAnchorId: number;
+  title: string;
+  createdAt: Date;
+
+  // State
   lastActivity: Date | null = null;
   queryStarted: Date | null = null;
   currentTool: string | null = null;
@@ -77,11 +67,19 @@ class ClaudeSession {
   lastUsage: TokenUsage | null = null;
   lastMessage: string | null = null;
 
+  // Execution control
   private abortController: AbortController | null = null;
   private isQueryRunning = false;
   private stopRequested = false;
   private _isProcessing = false;
   private _wasInterruptedByNewMessage = false;
+
+  constructor(chatId: number, threadAnchorId: number, title?: string) {
+    this.chatId = chatId;
+    this.threadAnchorId = threadAnchorId;
+    this.title = title || "Untitled";
+    this.createdAt = new Date();
+  }
 
   get isActive(): boolean {
     return this.sessionId !== null;
@@ -99,7 +97,6 @@ class ClaudeSession {
     const was = this._wasInterruptedByNewMessage;
     this._wasInterruptedByNewMessage = false;
     if (was) {
-      // Clear stopRequested so the new message can proceed
       this.stopRequested = false;
     }
     return was;
@@ -113,7 +110,7 @@ class ClaudeSession {
   }
 
   /**
-   * Clear the stopRequested flag (used after interrupt to allow new message to proceed).
+   * Clear the stopRequested flag.
    */
   clearStopRequested(): void {
     this.stopRequested = false;
@@ -132,21 +129,22 @@ class ClaudeSession {
 
   /**
    * Stop the currently running query or mark for cancellation.
-   * Returns: "stopped" if query was aborted, "pending" if processing will be cancelled, false if nothing running
    */
   async stop(): Promise<"stopped" | "pending" | false> {
-    // If a query is actively running, abort it
     if (this.isQueryRunning && this.abortController) {
       this.stopRequested = true;
       this.abortController.abort();
-      console.log("Stop requested - aborting current query");
+      console.log(
+        `[Thread ${this.threadAnchorId}] Stop requested - aborting current query`
+      );
       return "stopped";
     }
 
-    // If processing but query not started yet
     if (this._isProcessing) {
       this.stopRequested = true;
-      console.log("Stop requested - will cancel before query starts");
+      console.log(
+        `[Thread ${this.threadAnchorId}] Stop requested - will cancel before query starts`
+      );
       return "pending";
     }
 
@@ -155,21 +153,17 @@ class ClaudeSession {
 
   /**
    * Send a message to Claude with streaming updates via callback.
-   *
-   * @param ctx - grammY context for ask_user button display
    */
   async sendMessageStreaming(
     message: string,
     username: string,
     userId: number,
     statusCallback: StatusCallback,
-    chatId?: number,
     ctx?: Context
   ): Promise<string> {
     // Set chat context for ask_user MCP tool
-    if (chatId) {
-      process.env.TELEGRAM_CHAT_ID = String(chatId);
-    }
+    process.env.TELEGRAM_CHAT_ID = String(this.chatId);
+    process.env.TELEGRAM_THREAD_ANCHOR_ID = String(this.threadAnchorId);
 
     const isNewSession = !this.isActive;
     const thinkingTokens = getThinkingLevel(message);
@@ -177,7 +171,10 @@ class ClaudeSession {
       { 0: "off", 10000: "normal", 50000: "deep" }[thinkingTokens] ||
       String(thinkingTokens);
 
-    // Inject current date/time at session start so Claude doesn't need to call a tool for it
+    // Store last message for retry
+    this.lastMessage = message;
+
+    // Inject current date/time at session start
     let messageToSend = message;
     if (isNewSession) {
       const now = new Date();
@@ -196,7 +193,7 @@ class ClaudeSession {
       messageToSend = datePrefix + message;
     }
 
-    // Build SDK V1 options - supports all features
+    // Build SDK options
     const options: Options = {
       model: "claude-sonnet-4-5",
       cwd: WORKING_DIR,
@@ -210,27 +207,25 @@ class ClaudeSession {
       resume: this.sessionId || undefined,
     };
 
-    // Add Claude Code executable path if set (required for standalone builds)
     if (process.env.CLAUDE_CODE_PATH) {
       options.pathToClaudeCodeExecutable = process.env.CLAUDE_CODE_PATH;
     }
 
     if (this.sessionId && !isNewSession) {
       console.log(
-        `RESUMING session ${this.sessionId.slice(
-          0,
-          8
-        )}... (thinking=${thinkingLabel})`
+        `[Thread ${this.threadAnchorId}] RESUMING session ${this.sessionId.slice(0, 8)}... (thinking=${thinkingLabel})`
       );
     } else {
-      console.log(`STARTING new Claude session (thinking=${thinkingLabel})`);
+      console.log(
+        `[Thread ${this.threadAnchorId}] STARTING new Claude session (thinking=${thinkingLabel})`
+      );
       this.sessionId = null;
     }
 
     // Check if stop was requested during processing phase
     if (this.stopRequested) {
       console.log(
-        "Query cancelled before starting (stop was requested during processing)"
+        `[Thread ${this.threadAnchorId}] Query cancelled before starting`
       );
       this.stopRequested = false;
       throw new Error("Query cancelled");
@@ -252,7 +247,6 @@ class ClaudeSession {
     let askUserTriggered = false;
 
     try {
-      // Use V1 query() API - supports all options including cwd, mcpServers, etc.
       const queryInstance = query({
         prompt: messageToSend,
         options: {
@@ -261,19 +255,18 @@ class ClaudeSession {
         },
       });
 
-      // Process streaming response
       for await (const event of queryInstance) {
-        // Check for abort
         if (this.stopRequested) {
-          console.log("Query aborted by user");
+          console.log(`[Thread ${this.threadAnchorId}] Query aborted by user`);
           break;
         }
 
         // Capture session_id from first message
         if (!this.sessionId && event.session_id) {
           this.sessionId = event.session_id;
-          console.log(`GOT session_id: ${this.sessionId!.slice(0, 8)}...`);
-          this.saveSession();
+          console.log(
+            `[Thread ${this.threadAnchorId}] GOT session_id: ${this.sessionId!.slice(0, 8)}...`
+          );
         }
 
         // Handle different message types
@@ -283,7 +276,9 @@ class ClaudeSession {
             if (block.type === "thinking") {
               const thinkingText = block.thinking;
               if (thinkingText) {
-                console.log(`THINKING BLOCK: ${thinkingText.slice(0, 100)}...`);
+                console.log(
+                  `[Thread ${this.threadAnchorId}] THINKING: ${thinkingText.slice(0, 100)}...`
+                );
                 await statusCallback("thinking", thinkingText);
               }
             }
@@ -298,7 +293,9 @@ class ClaudeSession {
                 const command = String(toolInput.command || "");
                 const [isSafe, reason] = checkCommandSafety(command);
                 if (!isSafe) {
-                  console.warn(`BLOCKED: ${reason}`);
+                  console.warn(
+                    `[Thread ${this.threadAnchorId}] BLOCKED: ${reason}`
+                  );
                   await statusCallback("tool", `BLOCKED: ${reason}`);
                   throw new Error(`Unsafe command blocked: ${reason}`);
                 }
@@ -308,7 +305,6 @@ class ClaudeSession {
               if (["Read", "Write", "Edit"].includes(toolName)) {
                 const filePath = String(toolInput.file_path || "");
                 if (filePath) {
-                  // Allow reads from temp paths and .claude directories
                   const isTmpRead =
                     toolName === "Read" &&
                     (TEMP_PATHS.some((p) => filePath.startsWith(p)) ||
@@ -316,7 +312,7 @@ class ClaudeSession {
 
                   if (!isTmpRead && !isPathAllowed(filePath)) {
                     console.warn(
-                      `BLOCKED: File access outside allowed paths: ${filePath}`
+                      `[Thread ${this.threadAnchorId}] BLOCKED: File access outside allowed paths: ${filePath}`
                     );
                     await statusCallback("tool", `Access denied: ${filePath}`);
                     throw new Error(`File access blocked: ${filePath}`);
@@ -339,23 +335,21 @@ class ClaudeSession {
               const toolDisplay = formatToolStatus(toolName, toolInput);
               this.currentTool = toolDisplay;
               this.lastTool = toolDisplay;
-              console.log(`Tool: ${toolDisplay}`);
+              console.log(`[Thread ${this.threadAnchorId}] Tool: ${toolDisplay}`);
 
-              // Don't show tool status for ask_user - the buttons are self-explanatory
               if (!toolName.startsWith("mcp__ask-user")) {
                 await statusCallback("tool", toolDisplay);
               }
 
-              // Check for pending ask_user requests after ask-user MCP tool
-              if (toolName.startsWith("mcp__ask-user") && ctx && chatId) {
-                // Small delay to let MCP server write the file
+              // Check for pending ask_user requests
+              if (toolName.startsWith("mcp__ask-user") && ctx) {
                 await new Promise((resolve) => setTimeout(resolve, 200));
 
-                // Retry a few times in case of timing issues
                 for (let attempt = 0; attempt < 3; attempt++) {
                   const buttonsSent = await checkPendingAskUserRequests(
                     ctx,
-                    chatId
+                    this.chatId,
+                    this.threadAnchorId
                   );
                   if (buttonsSent) {
                     askUserTriggered = true;
@@ -373,7 +367,6 @@ class ClaudeSession {
               responseParts.push(block.text);
               currentSegmentText += block.text;
 
-              // Stream text updates (throttled)
               const now = Date.now();
               if (
                 now - lastTextUpdate > STREAMING_THROTTLE_MS &&
@@ -389,7 +382,6 @@ class ClaudeSession {
             }
           }
 
-          // Break out of event loop if ask_user was triggered
           if (askUserTriggered) {
             break;
           }
@@ -397,23 +389,18 @@ class ClaudeSession {
 
         // Result message
         if (event.type === "result") {
-          console.log("Response complete");
+          console.log(`[Thread ${this.threadAnchorId}] Response complete`);
           queryCompleted = true;
 
-          // Capture usage if available
           if ("usage" in event && event.usage) {
             this.lastUsage = event.usage as TokenUsage;
             const u = this.lastUsage;
             console.log(
-              `Usage: in=${u.input_tokens} out=${u.output_tokens} cache_read=${
-                u.cache_read_input_tokens || 0
-              } cache_create=${u.cache_creation_input_tokens || 0}`
+              `[Thread ${this.threadAnchorId}] Usage: in=${u.input_tokens} out=${u.output_tokens} cache_read=${u.cache_read_input_tokens || 0} cache_create=${u.cache_creation_input_tokens || 0}`
             );
           }
         }
       }
-
-      // V1 query completes automatically when the generator ends
     } catch (error) {
       const errorStr = String(error).toLowerCase();
       const isCleanupError =
@@ -423,9 +410,11 @@ class ClaudeSession {
         isCleanupError &&
         (queryCompleted || askUserTriggered || this.stopRequested)
       ) {
-        console.warn(`Suppressed post-completion error: ${error}`);
+        console.warn(
+          `[Thread ${this.threadAnchorId}] Suppressed post-completion error: ${error}`
+        );
       } else {
-        console.error(`Error in query: ${error}`);
+        console.error(`[Thread ${this.threadAnchorId}] Error in query: ${error}`);
         this.lastError = String(error).slice(0, 100);
         this.lastErrorTime = new Date();
         throw error;
@@ -441,13 +430,11 @@ class ClaudeSession {
     this.lastError = null;
     this.lastErrorTime = null;
 
-    // If ask_user was triggered, return early - user will respond via button
     if (askUserTriggered) {
       await statusCallback("done", "");
       return "[Waiting for user selection]";
     }
 
-    // Emit final segment
     if (currentSegmentText) {
       await statusCallback("segment_end", currentSegmentText, currentSegmentId);
     }
@@ -458,76 +445,43 @@ class ClaudeSession {
   }
 
   /**
-   * Kill the current session (clear session_id).
+   * Kill the session (clear session_id).
    */
   async kill(): Promise<void> {
     this.sessionId = null;
     this.lastActivity = null;
-    console.log("Session cleared");
+    console.log(`[Thread ${this.threadAnchorId}] Session cleared`);
   }
 
   /**
-   * Save session to disk for resume after restart.
+   * Convert to persistable data.
    */
-  private saveSession(): void {
-    if (!this.sessionId) return;
-
-    try {
-      const data: SessionData = {
-        session_id: this.sessionId,
-        saved_at: new Date().toISOString(),
-        working_dir: WORKING_DIR,
-      };
-      Bun.write(SESSION_FILE, JSON.stringify(data));
-      console.log(`Session saved to ${SESSION_FILE}`);
-    } catch (error) {
-      console.warn(`Failed to save session: ${error}`);
-    }
+  toData(): ThreadSessionData {
+    return {
+      session_id: this.sessionId || "",
+      chat_id: this.chatId,
+      thread_anchor_id: this.threadAnchorId,
+      created_at: this.createdAt.toISOString(),
+      last_activity: this.lastActivity?.toISOString() || new Date().toISOString(),
+      working_dir: WORKING_DIR,
+      title: this.title,
+    };
   }
 
   /**
-   * Resume the last persisted session.
+   * Create ThreadSession from persisted data.
    */
-  resumeLast(): [success: boolean, message: string] {
-    try {
-      const file = Bun.file(SESSION_FILE);
-      if (!file.size) {
-        return [false, "No saved session found"];
-      }
-
-      const text = readFileSync(SESSION_FILE, "utf-8");
-      const data: SessionData = JSON.parse(text);
-
-      if (!data.session_id) {
-        return [false, "Saved session file is empty"];
-      }
-
-      if (data.working_dir && data.working_dir !== WORKING_DIR) {
-        return [
-          false,
-          `Session was for different directory: ${data.working_dir}`,
-        ];
-      }
-
-      this.sessionId = data.session_id;
-      this.lastActivity = new Date();
-      console.log(
-        `Resumed session ${data.session_id.slice(0, 8)}... (saved at ${
-          data.saved_at
-        })`
-      );
-      return [
-        true,
-        `Resumed session \`${data.session_id.slice(0, 8)}...\` (saved at ${
-          data.saved_at
-        })`,
-      ];
-    } catch (error) {
-      console.error(`Failed to resume session: ${error}`);
-      return [false, `Failed to load session: ${error}`];
-    }
+  static fromData(data: ThreadSessionData): ThreadSession {
+    const session = new ThreadSession(
+      data.chat_id,
+      data.thread_anchor_id,
+      data.title
+    );
+    session.sessionId = data.session_id || null;
+    session.createdAt = new Date(data.created_at);
+    session.lastActivity = data.last_activity
+      ? new Date(data.last_activity)
+      : null;
+    return session;
   }
 }
-
-// Global session instance
-export const session = new ClaudeSession();

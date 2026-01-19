@@ -18,11 +18,28 @@ export interface RateLimitBucket {
   lastUpdate: number;
 }
 
-// Session persistence data
+// Session persistence data (legacy - single session)
 export interface SessionData {
   session_id: string;
   saved_at: string;
   working_dir: string;
+}
+
+// Thread-based session data for multi-session support
+export interface ThreadSessionData {
+  session_id: string;
+  chat_id: number;
+  thread_anchor_id: number;
+  created_at: string;
+  last_activity: string;
+  working_dir: string;
+  title?: string;
+}
+
+// Persisted sessions file structure
+export interface PersistedSessions {
+  version: number;
+  sessions: ThreadSessionData[];
 }
 
 // Token usage from Claude

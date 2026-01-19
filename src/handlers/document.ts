@@ -3,10 +3,11 @@
  *
  * Supports PDFs and text files with media group buffering.
  * PDF extraction uses pdftotext CLI (install via: brew install poppler)
+ * All replies are threaded to the user's message for conversation organization.
  */
 
 import type { Context } from "grammy";
-import { session } from "../session";
+import { sessionManager } from "../session-manager";
 import { ALLOWED_USERS, TEMP_DIR } from "../config";
 import { isAuthorized, rateLimiter } from "../security";
 import { auditLog, auditLogRateLimit, startTypingIndicator } from "../utils";
@@ -214,14 +215,23 @@ async function processArchive(
   caption: string | undefined,
   userId: number,
   username: string,
-  chatId: number
+  chatId: number,
+  threadAnchorId: number
 ): Promise<void> {
+  // Get or create session for this thread
+  const session = sessionManager.getOrCreateSession(
+    chatId,
+    threadAnchorId,
+    `[Archive: ${fileName}]`
+  );
+
   const stopProcessing = session.startProcessing();
   const typing = startTypingIndicator(ctx);
 
   // Show extraction progress
   const statusMsg = await ctx.reply(`📦 Extracting <b>${fileName}</b>...`, {
     parse_mode: "HTML",
+    reply_to_message_id: threadAnchorId,
   });
 
   try {
@@ -250,16 +260,15 @@ async function processArchive(
       ? `Archive: ${fileName}\n\nFile tree (${tree.length} files):\n${treeStr}\n\nExtracted contents:\n${contentsStr}\n\n---\n\n${caption}`
       : `Please analyze this archive (${fileName}):\n\nFile tree (${tree.length} files):\n${treeStr}\n\nExtracted contents:\n${contentsStr}`;
 
-    // Create streaming state
+    // Create streaming state with thread anchor
     const state = new StreamingState();
-    const statusCallback = createStatusCallback(ctx, state);
+    const statusCallback = createStatusCallback(ctx, state, threadAnchorId);
 
     const response = await session.sendMessageStreaming(
       prompt,
       username,
       userId,
       statusCallback,
-      chatId,
       ctx
     );
 
@@ -270,6 +279,8 @@ async function processArchive(
       `[${fileName}] ${caption || ""}`,
       response
     );
+
+    sessionManager.saveSessions();
 
     // Cleanup
     await Bun.$`rm -rf ${extractDir}`.quiet();
@@ -289,7 +300,8 @@ async function processArchive(
       // Ignore
     }
     await ctx.reply(
-      `❌ Failed to process archive: ${String(error).slice(0, 100)}`
+      `❌ Failed to process archive: ${String(error).slice(0, 100)}`,
+      { reply_to_message_id: threadAnchorId }
     );
   } finally {
     stopProcessing();
@@ -306,8 +318,18 @@ async function processDocuments(
   caption: string | undefined,
   userId: number,
   username: string,
-  chatId: number
+  chatId: number,
+  threadAnchorId: number
 ): Promise<void> {
+  // Get or create session for this thread
+  const titlePreview =
+    caption?.slice(0, 50) || `[${documents.length} document(s)]`;
+  const session = sessionManager.getOrCreateSession(
+    chatId,
+    threadAnchorId,
+    titlePreview
+  );
+
   // Mark processing started
   const stopProcessing = session.startProcessing();
 
@@ -330,9 +352,9 @@ async function processDocuments(
   // Start typing
   const typing = startTypingIndicator(ctx);
 
-  // Create streaming state
+  // Create streaming state with thread anchor
   const state = new StreamingState();
-  const statusCallback = createStatusCallback(ctx, state);
+  const statusCallback = createStatusCallback(ctx, state, threadAnchorId);
 
   try {
     const response = await session.sendMessageStreaming(
@@ -340,7 +362,6 @@ async function processDocuments(
       username,
       userId,
       statusCallback,
-      chatId,
       ctx
     );
 
@@ -351,8 +372,16 @@ async function processDocuments(
       `[${documents.length} docs] ${caption || ""}`,
       response
     );
+
+    sessionManager.saveSessions();
   } catch (error) {
-    await handleProcessingError(ctx, error, state.toolMessages);
+    await handleProcessingError(
+      ctx,
+      error,
+      state.toolMessages,
+      threadAnchorId,
+      chatId
+    );
   } finally {
     stopProcessing();
     typing.stop();
@@ -368,7 +397,8 @@ async function processDocumentPaths(
   caption: string | undefined,
   userId: number,
   username: string,
-  chatId: number
+  chatId: number,
+  threadAnchorId: number
 ): Promise<void> {
   // Extract text from all documents
   const documents: Array<{ path: string; name: string; content: string }> = [];
@@ -384,11 +414,21 @@ async function processDocumentPaths(
   }
 
   if (documents.length === 0) {
-    await ctx.reply("❌ Failed to extract any documents.");
+    await ctx.reply("❌ Failed to extract any documents.", {
+      reply_to_message_id: threadAnchorId,
+    });
     return;
   }
 
-  await processDocuments(ctx, documents, caption, userId, username, chatId);
+  await processDocuments(
+    ctx,
+    documents,
+    caption,
+    userId,
+    username,
+    chatId,
+    threadAnchorId
+  );
 }
 
 /**
@@ -400,20 +440,25 @@ export async function handleDocument(ctx: Context): Promise<void> {
   const chatId = ctx.chat?.id;
   const doc = ctx.message?.document;
   const mediaGroupId = ctx.message?.media_group_id;
+  const messageId = ctx.message?.message_id;
 
-  if (!userId || !chatId || !doc) {
+  if (!userId || !chatId || !doc || !messageId) {
     return;
   }
 
   // 1. Authorization check
   if (!isAuthorized(userId, ALLOWED_USERS)) {
-    await ctx.reply("Unauthorized. Contact the bot owner for access.");
+    await ctx.reply("Unauthorized. Contact the bot owner for access.", {
+      reply_to_message_id: messageId,
+    });
     return;
   }
 
   // 2. Check file size
   if (doc.file_size && doc.file_size > MAX_FILE_SIZE) {
-    await ctx.reply("❌ File too large. Maximum size is 10MB.");
+    await ctx.reply("❌ File too large. Maximum size is 10MB.", {
+      reply_to_message_id: messageId,
+    });
     return;
   }
 
@@ -430,7 +475,8 @@ export async function handleDocument(ctx: Context): Promise<void> {
       `❌ Unsupported file type: ${extension || doc.mime_type}\n\n` +
         `Supported: PDF, archives (${ARCHIVE_EXTENSIONS.join(
           ", "
-        )}), ${TEXT_EXTENSIONS.join(", ")}`
+        )}), ${TEXT_EXTENSIONS.join(", ")}`,
+      { reply_to_message_id: messageId }
     );
     return;
   }
@@ -441,9 +487,14 @@ export async function handleDocument(ctx: Context): Promise<void> {
     docPath = await downloadDocument(ctx);
   } catch (error) {
     console.error("Failed to download document:", error);
-    await ctx.reply("❌ Failed to download document.");
+    await ctx.reply("❌ Failed to download document.", {
+      reply_to_message_id: messageId,
+    });
     return;
   }
+
+  // User's message is the thread anchor
+  const threadAnchorId = messageId;
 
   // 5. Archive files - process separately (no media group support)
   if (isArchiveFile) {
@@ -452,7 +503,8 @@ export async function handleDocument(ctx: Context): Promise<void> {
     if (!allowed) {
       await auditLogRateLimit(userId, username, retryAfter!);
       await ctx.reply(
-        `⏳ Rate limited. Please wait ${retryAfter!.toFixed(1)} seconds.`
+        `⏳ Rate limited. Please wait ${retryAfter!.toFixed(1)} seconds.`,
+        { reply_to_message_id: threadAnchorId }
       );
       return;
     }
@@ -464,7 +516,8 @@ export async function handleDocument(ctx: Context): Promise<void> {
       ctx.message?.caption,
       userId,
       username,
-      chatId
+      chatId,
+      threadAnchorId
     );
     return;
   }
@@ -477,7 +530,8 @@ export async function handleDocument(ctx: Context): Promise<void> {
     if (!allowed) {
       await auditLogRateLimit(userId, username, retryAfter!);
       await ctx.reply(
-        `⏳ Rate limited. Please wait ${retryAfter!.toFixed(1)} seconds.`
+        `⏳ Rate limited. Please wait ${retryAfter!.toFixed(1)} seconds.`,
+        { reply_to_message_id: threadAnchorId }
       );
       return;
     }
@@ -490,12 +544,14 @@ export async function handleDocument(ctx: Context): Promise<void> {
         ctx.message?.caption,
         userId,
         username,
-        chatId
+        chatId,
+        threadAnchorId
       );
     } catch (error) {
       console.error("Failed to extract document:", error);
       await ctx.reply(
-        `❌ Failed to process document: ${String(error).slice(0, 100)}`
+        `❌ Failed to process document: ${String(error).slice(0, 100)}`,
+        { reply_to_message_id: threadAnchorId }
       );
     }
     return;

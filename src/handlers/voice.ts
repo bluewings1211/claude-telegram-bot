@@ -1,10 +1,13 @@
 /**
  * Voice message handler for Claude Telegram Bot.
+ *
+ * Handles incoming voice messages with thread-based conversation support.
+ * Voice is transcribed via OpenAI, then processed like a text message.
  */
 
 import type { Context } from "grammy";
 import { unlinkSync } from "fs";
-import { session } from "../session";
+import { sessionManager } from "../session-manager";
 import { ALLOWED_USERS, TEMP_DIR, TRANSCRIPTION_AVAILABLE } from "../config";
 import { isAuthorized, rateLimiter } from "../security";
 import {
@@ -23,21 +26,28 @@ export async function handleVoice(ctx: Context): Promise<void> {
   const username = ctx.from?.username || "unknown";
   const chatId = ctx.chat?.id;
   const voice = ctx.message?.voice;
+  const messageId = ctx.message?.message_id;
 
-  if (!userId || !voice || !chatId) {
+  if (!userId || !voice || !chatId || !messageId) {
     return;
   }
 
+  // Voice messages always start a new thread (user's voice message is the anchor)
+  const threadAnchorId = messageId;
+
   // 1. Authorization check
   if (!isAuthorized(userId, ALLOWED_USERS)) {
-    await ctx.reply("Unauthorized. Contact the bot owner for access.");
+    await ctx.reply("Unauthorized. Contact the bot owner for access.", {
+      reply_to_message_id: threadAnchorId,
+    });
     return;
   }
 
   // 2. Check if transcription is available
   if (!TRANSCRIPTION_AVAILABLE) {
     await ctx.reply(
-      "Voice transcription is not configured. Set OPENAI_API_KEY in .env"
+      "Voice transcription is not configured. Set OPENAI_API_KEY in .env",
+      { reply_to_message_id: threadAnchorId }
     );
     return;
   }
@@ -47,21 +57,29 @@ export async function handleVoice(ctx: Context): Promise<void> {
   if (!allowed) {
     await auditLogRateLimit(userId, username, retryAfter!);
     await ctx.reply(
-      `⏳ Rate limited. Please wait ${retryAfter!.toFixed(1)} seconds.`
+      `⏳ Rate limited. Please wait ${retryAfter!.toFixed(1)} seconds.`,
+      { reply_to_message_id: threadAnchorId }
     );
     return;
   }
 
-  // 4. Mark processing started (allows /stop to work during transcription/classification)
+  // 4. Get or create session for this thread
+  const session = sessionManager.getOrCreateSession(
+    chatId,
+    threadAnchorId,
+    "[Voice message]"
+  );
+
+  // 5. Mark processing started (allows /stop to work during transcription)
   const stopProcessing = session.startProcessing();
 
-  // 5. Start typing indicator for transcription
+  // 6. Start typing indicator for transcription
   const typing = startTypingIndicator(ctx);
 
   let voicePath: string | null = null;
 
   try {
-    // 6. Download voice file
+    // 7. Download voice file
     const file = await ctx.getFile();
     const timestamp = Date.now();
     voicePath = `${TEMP_DIR}/voice_${timestamp}.ogg`;
@@ -73,8 +91,10 @@ export async function handleVoice(ctx: Context): Promise<void> {
     const buffer = await downloadRes.arrayBuffer();
     await Bun.write(voicePath, buffer);
 
-    // 7. Transcribe
-    const statusMsg = await ctx.reply("🎤 Transcribing...");
+    // 8. Transcribe
+    const statusMsg = await ctx.reply("🎤 Transcribing...", {
+      reply_to_message_id: threadAnchorId,
+    });
 
     const transcript = await transcribeVoice(voicePath);
     if (!transcript) {
@@ -87,40 +107,48 @@ export async function handleVoice(ctx: Context): Promise<void> {
       return;
     }
 
-    // 8. Show transcript
+    // 9. Update session title with transcript preview
+    session.title = transcript.slice(0, 50);
+
+    // 10. Show transcript
     await ctx.api.editMessageText(
       chatId,
       statusMsg.message_id,
       `🎤 "${transcript}"`
     );
 
-    // 9. Create streaming state and callback
+    // 11. Create streaming state and callback
     const state = new StreamingState();
-    const statusCallback = createStatusCallback(ctx, state);
+    const statusCallback = createStatusCallback(ctx, state, threadAnchorId);
 
-    // 10. Send to Claude
+    // 12. Send to Claude
     const claudeResponse = await session.sendMessageStreaming(
       transcript,
       username,
       userId,
       statusCallback,
-      chatId,
       ctx
     );
 
-    // 11. Audit log
+    // 13. Audit log
     await auditLog(userId, username, "VOICE", transcript, claudeResponse);
+
+    // 14. Save sessions
+    sessionManager.saveSessions();
   } catch (error) {
-    console.error("Error processing voice:", error);
+    console.error(`[Thread ${threadAnchorId}] Error processing voice:`, error);
 
     if (String(error).includes("abort") || String(error).includes("cancel")) {
-      // Only show "Query stopped" if it was an explicit stop, not an interrupt from a new message
       const wasInterrupt = session.consumeInterruptFlag();
       if (!wasInterrupt) {
-        await ctx.reply("🛑 Query stopped.");
+        await ctx.reply("🛑 Query stopped.", {
+          reply_to_message_id: threadAnchorId,
+        });
       }
     } else {
-      await ctx.reply(`❌ Error: ${String(error).slice(0, 200)}`);
+      await ctx.reply(`❌ Error: ${String(error).slice(0, 200)}`, {
+        reply_to_message_id: threadAnchorId,
+      });
     }
   } finally {
     stopProcessing();

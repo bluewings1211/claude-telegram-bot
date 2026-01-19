@@ -210,8 +210,20 @@ export const RATE_LIMIT_WINDOW = parseInt(
 // ============== File Paths ==============
 
 export const SESSION_FILE = "/tmp/claude-telegram-session.json";
+export const SESSIONS_FILE = "/tmp/claude-telegram-sessions.json";
 export const RESTART_FILE = "/tmp/claude-telegram-restart.json";
 export const TEMP_DIR = "/tmp/telegram-bot";
+
+// ============== Multi-Session Configuration ==============
+
+export const MAX_CONCURRENT_SESSIONS = parseInt(
+  process.env.MAX_CONCURRENT_SESSIONS || "5",
+  10
+);
+export const SESSION_TIMEOUT_MS = parseInt(
+  process.env.SESSION_TIMEOUT_MS || "1800000", // 30 minutes
+  10
+);
 
 // Temp paths that are always allowed for bot operations
 export const TEMP_PATHS = ["/tmp/", "/private/tmp/", "/var/folders/"];

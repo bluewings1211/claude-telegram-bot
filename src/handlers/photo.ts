@@ -2,10 +2,11 @@
  * Photo message handler for Claude Telegram Bot.
  *
  * Supports single photos and media groups (albums) with 1s buffering.
+ * All replies are threaded to the user's message for conversation organization.
  */
 
 import type { Context } from "grammy";
-import { session } from "../session";
+import { sessionManager } from "../session-manager";
 import { ALLOWED_USERS, TEMP_DIR } from "../config";
 import { isAuthorized, rateLimiter } from "../security";
 import { auditLog, auditLogRateLimit, startTypingIndicator } from "../utils";
@@ -54,8 +55,17 @@ async function processPhotos(
   caption: string | undefined,
   userId: number,
   username: string,
-  chatId: number
+  chatId: number,
+  threadAnchorId: number
 ): Promise<void> {
+  // Get or create session for this thread
+  const titlePreview = caption?.slice(0, 50) || "[Photo analysis]";
+  const session = sessionManager.getOrCreateSession(
+    chatId,
+    threadAnchorId,
+    titlePreview
+  );
+
   // Mark processing started
   const stopProcessing = session.startProcessing();
 
@@ -75,9 +85,9 @@ async function processPhotos(
   // Start typing
   const typing = startTypingIndicator(ctx);
 
-  // Create streaming state
+  // Create streaming state with thread anchor
   const state = new StreamingState();
-  const statusCallback = createStatusCallback(ctx, state);
+  const statusCallback = createStatusCallback(ctx, state, threadAnchorId);
 
   try {
     const response = await session.sendMessageStreaming(
@@ -85,13 +95,13 @@ async function processPhotos(
       username,
       userId,
       statusCallback,
-      chatId,
       ctx
     );
 
     await auditLog(userId, username, "PHOTO", prompt, response);
+    sessionManager.saveSessions();
   } catch (error) {
-    await handleProcessingError(ctx, error, state.toolMessages);
+    await handleProcessingError(ctx, error, state.toolMessages, threadAnchorId, chatId);
   } finally {
     stopProcessing();
     typing.stop();
@@ -106,14 +116,17 @@ export async function handlePhoto(ctx: Context): Promise<void> {
   const username = ctx.from?.username || "unknown";
   const chatId = ctx.chat?.id;
   const mediaGroupId = ctx.message?.media_group_id;
+  const messageId = ctx.message?.message_id;
 
-  if (!userId || !chatId) {
+  if (!userId || !chatId || !messageId) {
     return;
   }
 
   // 1. Authorization check
   if (!isAuthorized(userId, ALLOWED_USERS)) {
-    await ctx.reply("Unauthorized. Contact the bot owner for access.");
+    await ctx.reply("Unauthorized. Contact the bot owner for access.", {
+      reply_to_message_id: messageId,
+    });
     return;
   }
 
@@ -126,13 +139,16 @@ export async function handlePhoto(ctx: Context): Promise<void> {
     if (!allowed) {
       await auditLogRateLimit(userId, username, retryAfter!);
       await ctx.reply(
-        `⏳ Rate limited. Please wait ${retryAfter!.toFixed(1)} seconds.`
+        `⏳ Rate limited. Please wait ${retryAfter!.toFixed(1)} seconds.`,
+        { reply_to_message_id: messageId }
       );
       return;
     }
 
     // Show status immediately
-    statusMsg = await ctx.reply("📷 Processing image...");
+    statusMsg = await ctx.reply("📷 Processing image...", {
+      reply_to_message_id: messageId,
+    });
   }
 
   // 3. Download photo
@@ -150,23 +166,31 @@ export async function handlePhoto(ctx: Context): Promise<void> {
         );
       } catch (editError) {
         console.debug("Failed to edit status message:", editError);
-        await ctx.reply("❌ Failed to download photo.");
+        await ctx.reply("❌ Failed to download photo.", {
+          reply_to_message_id: messageId,
+        });
       }
     } else {
-      await ctx.reply("❌ Failed to download photo.");
+      await ctx.reply("❌ Failed to download photo.", {
+        reply_to_message_id: messageId,
+      });
     }
     return;
   }
 
   // 4. Single photo - process immediately
   if (!mediaGroupId && statusMsg) {
+    // User's message is the thread anchor
+    const threadAnchorId = messageId;
+
     await processPhotos(
       ctx,
       [photoPath],
       ctx.message?.caption,
       userId,
       username,
-      chatId
+      chatId,
+      threadAnchorId
     );
 
     // Clean up status message
