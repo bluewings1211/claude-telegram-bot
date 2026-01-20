@@ -62,7 +62,8 @@ export function convertMarkdownToHtml(text: string): string {
   text = text.replace(/__([^_]+)__/g, "<b>$1</b>");
 
   // Italic: _text_ -> <i>text</i> (but not __text__)
-  text = text.replace(/(?<!_)_([^_]+)_(?!_)/g, "<i>$1</i>");
+  // Require whitespace or line boundary around underscores to avoid matching filenames like file_name.md
+  text = text.replace(/(^|\s)_([^_\n]+?)_($|\s)/gm, "$1<i>$2</i>$3");
 
   // Blockquotes: &gt; text -> <blockquote>text</blockquote>
   text = convertBlockquotes(text);
