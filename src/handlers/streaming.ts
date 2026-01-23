@@ -9,7 +9,7 @@ import type { Context } from "grammy";
 import type { Message } from "grammy/types";
 import { InlineKeyboard } from "grammy";
 import type { StatusCallback } from "../types";
-import { convertMarkdownToHtml, escapeHtml } from "../formatting";
+import { convertMarkdownToHtml, escapeHtml, splitHtmlSafely } from "../formatting";
 import {
   TELEGRAM_MESSAGE_LIMIT,
   TELEGRAM_SAFE_LIMIT,
@@ -210,14 +210,14 @@ export function createStatusCallback(
               console.debug("Failed to edit final message:", error);
             }
           } else {
-            // Too long - delete and split
+            // Too long - delete and split safely
             try {
               await ctx.api.deleteMessage(msg.chat.id, msg.message_id);
             } catch (error) {
               console.debug("Failed to delete message for splitting:", error);
             }
-            for (let i = 0; i < formatted.length; i += TELEGRAM_SAFE_LIMIT) {
-              const chunk = formatted.slice(i, i + TELEGRAM_SAFE_LIMIT);
+            const chunks = splitHtmlSafely(formatted, TELEGRAM_SAFE_LIMIT);
+            for (const chunk of chunks) {
               try {
                 await ctx.reply(chunk, {
                   parse_mode: "HTML",

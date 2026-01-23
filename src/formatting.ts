@@ -147,6 +147,102 @@ function convertBlockquotes(text: string): string {
 // Legacy alias
 export const convertMarkdownForTelegram = convertMarkdownToHtml;
 
+/**
+ * Split HTML content safely without breaking tags.
+ *
+ * Ensures each chunk has properly closed and reopened tags.
+ */
+export function splitHtmlSafely(html: string, maxLength: number): string[] {
+  if (html.length <= maxLength) {
+    return [html];
+  }
+
+  const chunks: string[] = [];
+  let remaining = html;
+
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLength) {
+      chunks.push(remaining);
+      break;
+    }
+
+    // Find a safe split point
+    let splitPoint = maxLength;
+
+    // Don't split in the middle of an HTML tag
+    // Look for the last '>' before maxLength that's not inside a tag
+    const beforeMax = remaining.slice(0, maxLength);
+    const lastTagClose = beforeMax.lastIndexOf(">");
+    const lastTagOpen = beforeMax.lastIndexOf("<");
+
+    // If we're inside an unclosed tag, back up to before it
+    if (lastTagOpen > lastTagClose) {
+      splitPoint = lastTagOpen;
+    }
+
+    // If splitPoint is too small, try to find a better spot
+    if (splitPoint < maxLength * 0.5) {
+      // Fall back to character split but avoid mid-entity
+      splitPoint = maxLength;
+      // Don't split HTML entities like &amp;
+      const entityMatch = remaining.slice(splitPoint - 10, splitPoint + 5).match(/&\w*;?/);
+      if (entityMatch) {
+        const entityStart = remaining.lastIndexOf("&", splitPoint);
+        if (entityStart > splitPoint - 10) {
+          splitPoint = entityStart;
+        }
+      }
+    }
+
+    // Extract the chunk and find unclosed tags
+    let chunk = remaining.slice(0, splitPoint);
+    remaining = remaining.slice(splitPoint);
+
+    // Track open tags that need to be closed
+    const openTags: string[] = [];
+    const tagPattern = /<\/?(\w+)[^>]*>/g;
+    let match;
+
+    while ((match = tagPattern.exec(chunk)) !== null) {
+      const fullTag = match[0];
+      const tagName = match[1]!.toLowerCase();
+
+      // Skip self-closing or void elements
+      if (
+        fullTag.endsWith("/>") ||
+        ["br", "hr", "img", "input", "meta", "link"].includes(tagName)
+      ) {
+        continue;
+      }
+
+      if (fullTag.startsWith("</")) {
+        // Closing tag - remove from stack
+        const idx = openTags.lastIndexOf(tagName);
+        if (idx !== -1) {
+          openTags.splice(idx, 1);
+        }
+      } else {
+        // Opening tag - add to stack
+        openTags.push(tagName);
+      }
+    }
+
+    // Close any unclosed tags in this chunk (reverse order)
+    for (let i = openTags.length - 1; i >= 0; i--) {
+      chunk += `</${openTags[i]}>`;
+    }
+
+    chunks.push(chunk);
+
+    // Reopen tags in the next chunk
+    if (remaining.length > 0 && openTags.length > 0) {
+      remaining = openTags.map((tag) => `<${tag}>`).join("") + remaining;
+    }
+  }
+
+  return chunks;
+}
+
 // ============== Tool Status Formatting ==============
 
 /**
